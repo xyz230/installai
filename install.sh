@@ -1,73 +1,126 @@
 #!/bin/bash
+set -e
 
-# CatMi - Script di Installazione Automatica per Ubuntu 22.04
-# Questo script installa tutto il necessario per far funzionare CatMi su una VPS Ubuntu 22.04
+# === CONFIGURAZIONE ===
+DOMAIN="catmi.it"
+APP_DIR="/var/www/catmi"
+NGINX_CONFIG="/etc/nginx/sites-available/catmi"
+SSL_EMAIL="admin@catmi.it"
+GIT_REPO="https://github.com/TUA-ORG/catmi.git" # <-- CAMBIA con URL reale
 
-set -e  # Exit on any error
-
-# Colors for output
+# === COLORI ===
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-# Domain configuration
-DOMAIN="catmi.it"
-APP_DIR="/var/www/catmi"
-NGINX_CONFIG="/etc/nginx/sites-available/catmi"
-SSL_EMAIL="admin@catmi.it"  # Cambia con la tua email per Let's Encrypt
+# === FUNZIONI ===
+print_status()   { echo -e "${GREEN}✅ $1${NC}"; }
+print_warning()  { echo -e "${YELLOW}⚠️ $1${NC}"; }
+print_error()    { echo -e "${RED}❌ $1${NC}"; }
+print_info()     { echo -e "${BLUE}ℹ️ $1${NC}"; }
+command_exists() { command -v "$1" >/dev/null 2>&1; }
 
-echo -e "${BLUE}🐱 Benvenuto nell'installer di CatMi!${NC}"
-echo -e "${BLUE}Questo script installerà tutto il necessario per far funzionare CatMi su Ubuntu 22.04${NC}"
-echo ""
-
-# Check if running as root
+# === CONTROLLO UTENTE ===
 if [[ $EUID -eq 0 ]]; then
-   echo -e "${RED}❌ Non eseguire questo script come root. Usa un utente con privilegi sudo.${NC}" 
+   print_error "Non eseguire questo script come root. Usa un utente con sudo."
    exit 1
 fi
 
-# Function to print status
-print_status() {
-    echo -e "${GREEN}✅ $1${NC}"
-}
+echo -e "${BLUE}🐱 Benvenuto nell'installer di CatMi!${NC}"
 
-print_warning() {
-    echo -e "${YELLOW}⚠️ $1${NC}"
-}
-
-print_error() {
-    echo -e "${RED}❌ $1${NC}"
-}
-
-print_info() {
-    echo -e "${BLUE}ℹ️ $1${NC}"
-}
-
-# Function to check if command exists
-command_exists() {
-    command -v "$1" >/dev/null 2>&1
-}
-
-echo -e "${BLUE}🔄 Aggiornamento del sistema...${NC}"
+# === AGGIORNAMENTO SISTEMA ===
+print_info "Aggiornamento sistema..."
 sudo apt update && sudo apt upgrade -y
 print_status "Sistema aggiornato"
 
-echo -e "${BLUE}🔧 Installazione delle dipendenze di base...${NC}"
+# === DIPENDENZE BASE ===
+print_info "Installazione dipendenze base..."
 sudo apt install -y curl wget git vim htop ufw software-properties-common apt-transport-https ca-certificates gnupg lsb-release unzip
-print_status "Dipendenze di base installate"
+print_status "Dipendenze base installate"
 
-# Install Nginx
-echo -e "${BLUE}🌐 Installazione di Nginx...${NC}"
+# === NGINX ===
+print_info "Installazione Nginx..."
 if ! command_exists nginx; then
     sudo apt install -y nginx
     sudo systemctl enable nginx
     sudo systemctl start nginx
-    print_status "Nginx installato e avviato"
+    print_status "Nginx installato"
 else
     print_warning "Nginx già installato"
 fi
 
-# Install Certbot for SSL
-echo -
+# === CERTBOT ===
+print_info "Installazione Certbot..."
+sudo apt install -y certbot python3-certbot-nginx
+print_status "Certbot installato"
+
+# === NODE.JS & PM2 ===
+print_info "Installazione Node.js e PM2..."
+if ! command_exists node; then
+    sudo apt remove -y nodejs libnode-dev npm || true
+    curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
+    sudo apt install -y nodejs
+fi
+sudo npm install -g pm2
+print_status "Node.js e PM2 installati"
+
+# === CLONAZIONE PROGETTO ===
+print_info "Clonazione progetto..."
+if [ ! -d "$APP_DIR" ]; then
+    sudo git clone "$GIT_REPO" "$APP_DIR"
+    sudo chown -R $USER:$USER "$APP_DIR"
+else
+    print_warning "Cartella già presente, skip clonazione"
+fi
+
+# === DIPENDENZE NPM ===
+print_info "Installazione dipendenze npm..."
+cd "$APP_DIR"
+npm install
+print_status "Dipendenze npm installate"
+
+# === CONFIGURAZIONE NGINX ===
+print_info "Configurazione Nginx per $DOMAIN..."
+sudo tee "$NGINX_CONFIG" > /dev/null <<EOF
+server {
+    listen 80;
+    server_name $DOMAIN www.$DOMAIN;
+
+    root $APP_DIR;
+    index index.html index.htm;
+
+    location / {
+        proxy_pass http://localhost:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host \$host;
+        proxy_cache_bypass \$http_upgrade;
+    }
+}
+EOF
+sudo ln -sf "$NGINX_CONFIG" /etc/nginx/sites-enabled/catmi
+sudo nginx -t && sudo systemctl reload nginx
+print_status "Nginx configurato"
+
+# === CERTIFICATO SSL ===
+print_info "Generazione certificato SSL..."
+sudo certbot --nginx -d "$DOMAIN" -d "www.$DOMAIN" --non-interactive --agree-tos -m "$SSL_EMAIL"
+print_status "SSL installato"
+
+# === AVVIO APP CON PM2 ===
+print_info "Avvio app con PM2..."
+pm2 start npm --name "catmi" -- run start
+pm2 save
+pm2 startup systemd -u $USER --hp $HOME
+print_status "App avviata"
+
+# === FIREWALL ===
+print_info "Configurazione firewall..."
+sudo ufw allow 'Nginx Full'
+sudo ufw --force enable
+print_status "Firewall configurato"
+
+print_status "Installazione completata! 🎉"
